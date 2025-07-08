@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# type: ignore
+
 from dataclasses import dataclass, field
 from typing import Optional, Union
 
@@ -194,6 +196,10 @@ class GRPOConfig(TrainingArguments):
             masked. Recommended value is `0.8`.
         use_liger_loss (`bool`, *optional*, defaults to `False`):
             Whether to use the Liger GRPO loss.
+        use_spro (`bool`, *optional*, defaults to `False`):
+            Whether to use the SPRO per-token advantage computation.
+        spro_beta (`float`, *optional*, defaults to `0.001`):
+            The beta parameter for the SPRO per-token advantage computation.
 
         > Parameters that control the logging
 
@@ -522,6 +528,14 @@ class GRPOConfig(TrainingArguments):
             "Positions in the completion with entropy below this percentile are masked out."
             "0.8 is the recommended value if you'd like to enable entropy based masking."
         },
+    )
+    use_spro: bool = field(
+        default=False,
+        metadata={"help": "Whether to use the SPRO per-token advantage computation."},
+    )
+    spro_beta: float = field(
+        default=0.001,
+        metadata={"help": "The beta parameter for the SPRO per-token advantage computation."},
     )
     use_liger_loss: bool = field(
         default=False,

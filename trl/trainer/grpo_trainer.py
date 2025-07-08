@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# type: ignore
+
 import os
 import re
 import textwrap
@@ -591,6 +593,9 @@ class GRPOTrainer(Trainer):
             disable_dropout_in_model(model)
             if self.ref_model is not None:
                 disable_dropout_in_model(self.ref_model)
+
+        self.use_spro = args.use_spro
+        self.spro_beta = args.spro_beta
 
         # Liger loss
         if self.use_liger_loss:
@@ -1277,7 +1282,12 @@ class GRPOTrainer(Trainer):
             # When using num_iterations == 1 and steps_per_generation <= gradient_accumulation_steps
             # old_per_token_logps == per_token_logps, so we can skip it's computation here, and use
             # per_token_logps.detach() instead.
-            if self.num_iterations > 1 or self.args.steps_per_generation > self.args.gradient_accumulation_steps:
+            # However, if we're using SPRO, we need to compute the old_per_token_logps always.
+            if (
+                self.num_iterations > 1
+                or self.args.steps_per_generation > self.args.gradient_accumulation_steps
+                or self.use_spro
+            ):
                 old_per_token_logps = self._get_per_token_logps_and_entropies(
                     self.model, prompt_completion_ids, attention_mask, logits_to_keep, batch_size
                 )["logps"]
@@ -1327,6 +1337,19 @@ class GRPOTrainer(Trainer):
         advantages = rewards - mean_grouped_rewards
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
+        advantages = advantages.unsqueeze(1)
+
+        # Compute SPRO advantages
+        if self.use_spro:
+            if ref_per_token_logps is None:
+                cpr = self.spro_beta * torch.cumsum(old_per_token_logps, dim=1)
+            else:
+                cpr = self.spro_beta * torch.cumsum(old_per_token_logps - ref_per_token_logps, dim=1)
+            generation_length = cpr.size(1)
+            cpr_masked = (cpr * completion_mask).reshape((-1, self.num_generations, generation_length))
+            mask_cpr_sum = cpr_masked.sum(dim=1, keepdim=True)
+            spro_advantages = (cpr_masked - mask_cpr_sum).reshape((-1, generation_length))
+            advantages = advantages + spro_advantages
 
         # Slice to keep only the local part of the data
         process_slice = slice(
@@ -1476,8 +1499,8 @@ class GRPOTrainer(Trainer):
         if self.args.delta is not None:
             coef_1 = torch.clamp(coef_1, max=self.args.delta)
 
-        per_token_loss1 = coef_1 * advantages.unsqueeze(1)
-        per_token_loss2 = coef_2 * advantages.unsqueeze(1)
+        per_token_loss1 = coef_1 * advantages
+        per_token_loss2 = coef_2 * advantages
         per_token_loss = -torch.min(per_token_loss1, per_token_loss2)
         if entropy_mask is not None:
             per_token_loss = per_token_loss * entropy_mask
@@ -1501,8 +1524,8 @@ class GRPOTrainer(Trainer):
             self._metrics[mode]["kl"].append(self.accelerator.gather(mean_kl).nanmean().item())
 
         # Compute the clipped probability ratios
-        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages.unsqueeze(1) < 0)
-        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages.unsqueeze(1) > 0)
+        is_low_clipped = (coef_1 < 1 - self.epsilon_low) & (advantages < 0)
+        is_high_clipped = (coef_1 > 1 + self.epsilon_high) & (advantages > 0)
         is_region_clipped = is_low_clipped | is_high_clipped
 
         low_clip = (is_low_clipped * completion_mask).sum() / completion_mask.sum()
