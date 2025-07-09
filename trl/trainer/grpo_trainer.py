@@ -1326,6 +1326,19 @@ class GRPOTrainer(Trainer):
         # Apply weights to each reward function's output and sum
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
+        # Compute soft rewards
+        if self.use_spro:
+            if ref_per_token_logps is None:
+                logps = self.spro_beta * old_per_token_logps
+            else:
+                logps = self.spro_beta * (old_per_token_logps - ref_per_token_logps)
+            soft_rewards = logps.sum(dim=1)
+            soft_rewards_mean = soft_rewards.mean()
+            soft_rewards_std = soft_rewards.std()
+            self._metrics[mode]["rewards/soft_rewards/mean"].append(soft_rewards_mean.item())
+            self._metrics[mode]["rewards/soft_rewards/std"].append(soft_rewards_std.item())
+            rewards = rewards + soft_rewards
+
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
         std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
@@ -1338,18 +1351,6 @@ class GRPOTrainer(Trainer):
         if self.scale_rewards:
             advantages = advantages / (std_grouped_rewards + 1e-4)
         advantages = advantages.unsqueeze(1)
-
-        # Compute SPRO advantages
-        if self.use_spro:
-            if ref_per_token_logps is None:
-                cpr = self.spro_beta * torch.cumsum(old_per_token_logps, dim=1)
-            else:
-                cpr = self.spro_beta * torch.cumsum(old_per_token_logps - ref_per_token_logps, dim=1)
-            generation_length = cpr.size(1)
-            cpr_masked = (cpr * completion_mask).reshape((-1, self.num_generations, generation_length))
-            mask_cpr_sum = cpr_masked.sum(dim=1, keepdim=True)
-            spro_advantages = (cpr_masked - mask_cpr_sum).reshape((-1, generation_length))
-            advantages = advantages + spro_advantages
 
         # Slice to keep only the local part of the data
         process_slice = slice(
