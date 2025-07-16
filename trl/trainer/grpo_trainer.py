@@ -1267,11 +1267,6 @@ class GRPOTrainer(Trainer):
         # Sum along sequence dimension (dim=1) to get completion length per sequence, used for logging
         completion_lengths = completion_mask.sum(1)
 
-        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
-        if self.mask_truncated_completions:
-            truncated_completions = ~is_eos.any(dim=1)
-            completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
-
         # Concatenate prompt_mask with completion_mask for logit computation
         attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)  # (B, P+C)
 
@@ -1327,17 +1322,49 @@ class GRPOTrainer(Trainer):
         rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)
 
         # Compute soft rewards
+        reward_type = 'token'
         if self.use_spro:
             if ref_per_token_logps is None:
                 logps = self.spro_beta * old_per_token_logps
             else:
-                logps = self.spro_beta * (old_per_token_logps - ref_per_token_logps)
-            soft_rewards = logps.sum(dim=1)
-            soft_rewards_mean = soft_rewards.mean()
-            soft_rewards_std = soft_rewards.std()
-            self._metrics[mode]["rewards/soft_rewards/mean"].append(soft_rewards_mean.item())
-            self._metrics[mode]["rewards/soft_rewards/std"].append(soft_rewards_std.item())
-            rewards = rewards + soft_rewards
+                raise NotImplementedError("Reference model not supported for SPRO.")
+            logps = torch.where(completion_mask.to(bool), logps, 0.0)
+            if reward_type == 'sequence':
+                soft_rewards = logps.sum(dim=1) / completion_mask.sum(dim=1)  # Sequence-level return
+                rewards = rewards + soft_rewards
+                soft_advantages = 0.0
+
+            elif reward_type in ['cumulative', 'token']:
+                if reward_type == 'cumulative':
+                    soft_rewards = logps.cumsum(dim=1)                        # Cumulative rewards (SPRO)
+                elif reward_type == 'token':
+                    soft_rewards = logps.flip([1]).cumsum(dim=1).flip([1])    # Token-level return
+                else:
+                    raise ValueError(f"Invalid reward type: {reward_type}")
+
+                seqlen = soft_rewards.size(1)
+                # Masked mean over the generations
+                soft_rewards_sum = soft_rewards.view(-1, self.num_generations, seqlen).sum(dim=1, keepdim=True)
+                soft_rewards_n = completion_mask.view(-1, self.num_generations, seqlen).sum(dim=1, keepdim=True)
+                mean_group_soft_rewards = torch.where(soft_rewards_n > 0, soft_rewards_sum / soft_rewards_n, 0.0)
+                soft_advantages = (
+                    soft_rewards.view(-1, self.num_generations, seqlen) - mean_group_soft_rewards
+                ).view(-1, seqlen)
+                # scale = torch.clamp(100 / soft_advantages.sum(dim=1, keepdim=True).abs(), min=0, max=1)
+                scale = 1.0
+                soft_advantages = scale * soft_advantages
+                if torch.isnan(soft_advantages).any():
+                    import pdb; pdb.set_trace()
+                # self._metrics[mode]["rewards/soft_advantages/scale"].append(scale.mean().item())
+                self._metrics[mode]["rewards/soft_advantages/sum"].append(soft_advantages.sum().item())
+                self._metrics[mode]["rewards/soft_advantages/max"].append(soft_advantages.max().item())
+                self._metrics[mode]["rewards/soft_advantages/min"].append(soft_advantages.min().item())
+
+            else:
+                raise ValueError(f"Invalid reward type: {reward_type}")
+
+            self._metrics[mode]["rewards/soft_rewards/mean"].append(soft_rewards.mean().item())
+            self._metrics[mode]["rewards/soft_rewards/std"].append(soft_rewards.std().item())
 
         # Compute grouped-wise rewards
         mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
@@ -1352,6 +1379,9 @@ class GRPOTrainer(Trainer):
             advantages = advantages / (std_grouped_rewards + 1e-4)
         advantages = advantages.unsqueeze(1)
 
+        if self.use_spro:
+            advantages = advantages + soft_advantages
+
         # Slice to keep only the local part of the data
         process_slice = slice(
             self.accelerator.process_index * len(prompts),
@@ -1359,6 +1389,11 @@ class GRPOTrainer(Trainer):
         )
         all_process_advantages = advantages.clone()  # keep the aggregated advantages for logging
         advantages = advantages[process_slice]
+
+        # If mask_truncated_completions is enabled, zero out truncated completions in completion_mask
+        if self.mask_truncated_completions:
+            truncated_completions = ~is_eos.any(dim=1)
+            completion_mask = completion_mask * (~truncated_completions).unsqueeze(1).int()
 
         # Log the metrics
         if mode == "train":
